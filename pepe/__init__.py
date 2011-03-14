@@ -117,8 +117,19 @@ PREPROCESSOR_STATEMENT_REGEXP_PATTERNS = [
     '#\s*(?P<op>undef)\s+(?P<var>[^\s]*?)',
     '#\s*(?P<op>include)\s+"(?P<fname>.*?)"',
     r'#\s*(?P<op>include)\s+(?P<var>[^\s]+?)',
+    '#\s*(?P<op>process)\s+(?P<func>[^\s]+?)(\s+(?P<args>.+?))?',
 ]
 
+
+# processing example
+def indent(l,spaces=2):
+    return " "*spaces+l
+
+
+process = {
+    'none'  : None,
+    'indent': indent,
+}
 
 class PreprocessorError(Exception):
     def __init__(self, error_message, filename=None, line_number=None,
@@ -137,7 +148,7 @@ class PreprocessorError(Exception):
             >>> assert str(PreprocessorError("whatever", line_number=20, line="blahblah")) == "20: whatever"
             >>> assert str(PreprocessorError("whatever", filename="somefile.py", line="blahblah")) == "somefile.py: whatever"
             >>> assert str(PreprocessorError("whatever", line="blahblah")) == "whatever"
-        """
+            """
         s = ":".join([str(f) for f in [self.filename, self.line_number] if f])
         if s:
             s += ": "
@@ -273,10 +284,14 @@ def preprocess(input_file,
         temp_output_buffer = output_file
 
     defines['__FILE__'] = input_filename
-    SKIP, EMIT = range(2) # states
+    SKIP, EMIT, SKIPDEF = range(3) # states
     states = [(EMIT, # a state is (<emit-or-skip-lines-in-this-section>,
-               0, #             <have-emitted-in-this-if-block>,
-               0)]     #             <have-seen-'else'-in-this-if-block>)
+               0,    #             <have-emitted-in-this-if-block>,
+               0,    #             <have-seen-'else'-in-this-if-block>)
+               None)]#
+    if options.exclude_is_default:
+        states = [(SKIPDEF, 0, 0, None) ]
+
     line_number = 0
     for line in input_lines:
         line_number += 1
@@ -314,6 +329,27 @@ def preprocess(input_file,
                         del defines[var]
                     except KeyError:
                         pass
+            elif op == "process":
+                # TODO: add process directive to prove processing for current
+                # env, can be applied recursivley:
+                #                 level_0(level_1(level_2(line)))
+                # just add one field to state with a function pointer and add
+                # eval to emit line below
+                f = match.group("func")
+                a = match.group("args")
+                kwargs = {}
+                if a:
+                    kwargs = eval(a)
+                    
+                if process.has_key(f):
+                    s = states.pop()
+                    states.append((s[0], s[1], s[2], (process[f], kwargs)))
+                    logger.debug("process states: %r)", states[-1])
+                else:
+                    raise PreprocessorError(
+                             "could not find #process'ing function \"%s\"!",
+                             defines['__FILE__'],
+                             defines['__LINE__'], line)
             elif op == "include":
                 if not (states and states[-1][0] == SKIP):
                     if "var" in match.groupdict():
@@ -351,11 +387,11 @@ def preprocess(input_file,
                 try:
                     if states and states[-1][0] == SKIP:
                         # Were are nested in a SKIP-portion of an if-block.
-                        states.append((SKIP, 0, 0))
+                        states.append((SKIP, 0, 0, None))
                     elif _evaluate(expr, defines):
-                        states.append((EMIT, 1, 0))
+                        states.append((EMIT, 1, 0, None))
                     else:
-                        states.append((SKIP, 0, 0))
+                        states.append((SKIP, 0, 0, None))
                 except KeyError:
                     raise PreprocessorError("use of undefined variable in "\
                                             "#%s stmt" % op, defines['__FILE__']
@@ -370,14 +406,14 @@ def preprocess(input_file,
                                                 defines['__FILE__'],
                                                 defines['__LINE__'], line)
                     elif states[-1][1]: # if have emitted in this if-block
-                        states[-1] = (SKIP, 1, 0)
+                        states[-1] = (SKIP, 1, 0, None)
                     elif states[:-1] and states[-2][0] == SKIP:
                         # Were are nested in a SKIP-portion of an if-block.
-                        states[-1] = (SKIP, 0, 0)
+                        states[-1] = (SKIP, 0, 0, None)
                     elif _evaluate(expr, defines):
-                        states[-1] = (EMIT, 1, 0)
+                        states[-1] = (EMIT, 1, 0, None)
                     else:
-                        states[-1] = (SKIP, 0, 0)
+                        states[-1] = (SKIP, 0, 0, None)
                 except IndexError:
                     raise PreprocessorError("#elif stmt without leading #if "\
                                             "stmt", defines['__FILE__'],
@@ -390,12 +426,12 @@ def preprocess(input_file,
                                                 defines['__FILE__'],
                                                 defines['__LINE__'], line)
                     elif states[-1][1]: # if have emitted in this if-block
-                        states[-1] = (SKIP, 1, 1)
+                        states[-1] = (SKIP, 1, 1, None)
                     elif states[:-1] and states[-2][0] == SKIP:
                         # Were are nested in a SKIP-portion of an if-block.
-                        states[-1] = (SKIP, 0, 1)
+                        states[-1] = (SKIP, 0, 1, None)
                     else:
-                        states[-1] = (EMIT, 1, 1)
+                        states[-1] = (EMIT, 1, 1, None)
                 except IndexError:
                     raise PreprocessorError("#else stmt without leading #if "\
                                             "stmt", defines['__FILE__'],
@@ -424,6 +460,11 @@ def preprocess(input_file,
                     # XXX Should avoid recursive substitutions. But that
                     #     would be a pain right now.
                     sline = line
+                    if options.process:
+                        # apply all processing in reverse order
+                        for s  in reversed(states):
+                            if s[3] and s[3][0]:
+                                sline = s[3][0](sline, **s[3][1])
                     if should_substitute:
                         for name in reversed(sorted(defines, key=len)):
                             value = defines[name]
@@ -779,6 +820,17 @@ to display content types as read by pepe.""")
                         action='store_true',
                         default=False,
                         help='Display content types configuration and exit.')
+    parser.add_argument('-x',
+                        '--exclude-is-default',
+                        dest='exclude_is_default',
+                        action='store_true',
+                        default=False,
+                        help='No default emit, outputs only if-blocks that evaluate to true')
+    parser.add_argument('--process',
+                        dest='process',
+                        action='store_true',
+                        default=False,
+                        help='evaluate "process" directive')
     return parser.parse_args()
 
 

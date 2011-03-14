@@ -54,6 +54,8 @@ comment-groups:
   #- ['!', '']
   tex:
   - ['%', '']
+  structured-text:
+  - ['.. #', '']
 
 content-types:
   php:
